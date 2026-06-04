@@ -9,8 +9,7 @@ const HOST = process.env.HOST || "0.0.0.0";
 let db = null;
 function getDb() {
     if (!db) {
-        db = new DatabaseSync(DB_PATH);
-        db.prepare("PRAGMA journal_mode=WAL").run();
+        db = new DatabaseSync(DB_PATH, { readOnly: true });
     }
     return db;
 }

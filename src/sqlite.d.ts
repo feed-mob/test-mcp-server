@@ -7,6 +7,7 @@ declare module "node:sqlite" {
 
   interface DatabaseSyncOptions {
     open?: boolean;
+    readOnly?: boolean;
   }
 
   class StatementSync {

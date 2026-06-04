@@ -12,8 +12,7 @@ let db: DatabaseSync | null = null;
 
 function getDb(): DatabaseSync {
   if (!db) {
-    db = new DatabaseSync(DB_PATH);
-    db.prepare("PRAGMA journal_mode=WAL").run();
+    db = new DatabaseSync(DB_PATH, { readOnly: true });
   }
   return db;
 }
