@@ -2,7 +2,7 @@ import express, { Request, Response } from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { DatabaseSync } from "node:sqlite";
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 
 const DB_PATH = process.env.DB_PATH || "/app/data/db/docs.sqlite";
@@ -36,6 +36,41 @@ type SessionPayload = {
   email: string;
   exp: number;
 };
+
+type OAuthClient = {
+  client_id: string;
+  client_secret?: string;
+  redirect_uris: string[];
+  token_endpoint_auth_method?: string;
+  client_name?: string;
+  scope?: string;
+  client_id_issued_at: number;
+  client_secret_expires_at?: number;
+};
+
+type OAuthAuthorization = {
+  client_id: string;
+  redirect_uri: string;
+  state?: string;
+  code_challenge?: string;
+  code_challenge_method?: string;
+  resource?: string;
+};
+
+type OAuthCode = OAuthAuthorization & {
+  email: string;
+  exp: number;
+};
+
+type AccessToken = {
+  email: string;
+  exp: number;
+};
+
+const oauthClients = new Map<string, OAuthClient>();
+const pendingOAuthStates = new Map<string, OAuthAuthorization>();
+const authorizationCodes = new Map<string, OAuthCode>();
+const accessTokens = new Map<string, AccessToken>();
 
 function parseCookies(header: string | undefined): Record<string, string> {
   if (!header) return {};
@@ -111,11 +146,87 @@ function isAllowedEmail(email: string): boolean {
   return email.toLowerCase().endsWith(`@${ALLOWED_DOMAIN.toLowerCase()}`);
 }
 
+function oauthMetadata() {
+  return {
+    issuer: BASE_URL,
+    authorization_endpoint: `${BASE_URL}/authorize`,
+    token_endpoint: `${BASE_URL}/token`,
+    registration_endpoint: `${BASE_URL}/register`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code"],
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["client_secret_post", "none"],
+    scopes_supported: ["openid", "email", "profile"],
+  };
+}
+
+function protectedResourceMetadata() {
+  return {
+    resource: `${BASE_URL}/mcp`,
+    authorization_servers: [BASE_URL],
+    scopes_supported: ["openid", "email", "profile"],
+    bearer_methods_supported: ["header"],
+    resource_name: "Docs MCP Server",
+  };
+}
+
+function readBearerToken(req: Request): AccessToken | null {
+  const authorization = req.headers.authorization || "";
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  if (!match) return null;
+  const token = accessTokens.get(match[1]);
+  if (!token || token.exp < Date.now()) return null;
+  return token;
+}
+
 function unauthorized(res: Response): void {
+  res.setHeader(
+    "WWW-Authenticate",
+    `Bearer resource_metadata="${BASE_URL}/.well-known/oauth-protected-resource/mcp"`
+  );
   res.status(401).json({
     error: "unauthorized",
     authUrl: `${BASE_URL}/auth/google/login`,
   });
+}
+
+function redirectWithOAuthError(res: Response, redirectUri: string, error: string, state?: string): void {
+  const url = new URL(redirectUri);
+  url.searchParams.set("error", error);
+  if (state) url.searchParams.set("state", state);
+  res.redirect(url.toString());
+}
+
+async function exchangeGoogleCode(code: string, redirectUri: string): Promise<GoogleUser | null> {
+  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: GOOGLE_CLIENT_ID,
+      client_secret: GOOGLE_CLIENT_SECRET,
+      code,
+      grant_type: "authorization_code",
+      redirect_uri: redirectUri,
+    }),
+  });
+
+  if (!tokenResponse.ok) return null;
+
+  const tokenJson = (await tokenResponse.json()) as { access_token?: string };
+  if (!tokenJson.access_token) return null;
+
+  const userResponse = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+    headers: { Authorization: `Bearer ${tokenJson.access_token}` },
+  });
+
+  if (!userResponse.ok) return null;
+  return (await userResponse.json()) as GoogleUser;
+}
+
+function verifyPkce(codeVerifier: string, codeChallenge: string, method = "S256"): boolean {
+  if (method !== "S256") return false;
+  const actual = base64Url(createHash("sha256").update(codeVerifier).digest());
+  return safeEqual(actual, codeChallenge);
 }
 
 function createMcpServer(): McpServer {
@@ -237,6 +348,44 @@ app.get("/health", (_req: Request, res: Response) => {
   res.status(200).json({ ok: true });
 });
 
+app.get("/.well-known/oauth-authorization-server", (_req: Request, res: Response) => {
+  res.json(oauthMetadata());
+});
+
+app.get("/.well-known/oauth-protected-resource/mcp", (_req: Request, res: Response) => {
+  res.json(protectedResourceMetadata());
+});
+
+app.post("/register", (req: Request, res: Response) => {
+  const body = req.body as {
+    redirect_uris?: string[];
+    token_endpoint_auth_method?: string;
+    client_name?: string;
+    scope?: string;
+  };
+
+  if (!Array.isArray(body.redirect_uris) || body.redirect_uris.length === 0) {
+    res.status(400).json({ error: "invalid_client_metadata", error_description: "redirect_uris is required" });
+    return;
+  }
+
+  const clientId = randomBytes(16).toString("hex");
+  const isPublic = body.token_endpoint_auth_method === "none";
+  const client: OAuthClient = {
+    client_id: clientId,
+    client_secret: isPublic ? undefined : randomBytes(32).toString("hex"),
+    redirect_uris: body.redirect_uris,
+    token_endpoint_auth_method: body.token_endpoint_auth_method || (isPublic ? "none" : "client_secret_post"),
+    client_name: body.client_name,
+    scope: body.scope,
+    client_id_issued_at: Math.floor(Date.now() / 1000),
+    client_secret_expires_at: isPublic ? undefined : Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60,
+  };
+  oauthClients.set(clientId, client);
+
+  res.status(201).json(client);
+});
+
 app.get("/auth/google/login", (_req: Request, res: Response) => {
   if (!requireOAuthConfig(res)) return;
 
@@ -253,6 +402,46 @@ app.get("/auth/google/login", (_req: Request, res: Response) => {
   res.redirect(url.toString());
 });
 
+app.get("/authorize", (req: Request, res: Response) => {
+  if (!requireOAuthConfig(res)) return;
+
+  const clientId = String(req.query.client_id || "");
+  const redirectUri = String(req.query.redirect_uri || "");
+  const responseType = String(req.query.response_type || "");
+  const state = req.query.state ? String(req.query.state) : undefined;
+  const codeChallenge = req.query.code_challenge ? String(req.query.code_challenge) : undefined;
+  const codeChallengeMethod = req.query.code_challenge_method
+    ? String(req.query.code_challenge_method)
+    : undefined;
+  const resource = req.query.resource ? String(req.query.resource) : undefined;
+
+  const client = oauthClients.get(clientId);
+  if (!client || !client.redirect_uris.includes(redirectUri) || responseType !== "code") {
+    if (redirectUri) redirectWithOAuthError(res, redirectUri, "invalid_request", state);
+    else res.status(400).json({ error: "invalid_request" });
+    return;
+  }
+
+  const oauthState = randomBytes(24).toString("hex");
+  pendingOAuthStates.set(oauthState, {
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    state,
+    code_challenge: codeChallenge,
+    code_challenge_method: codeChallengeMethod,
+    resource,
+  });
+  setCookie(res, STATE_COOKIE, oauthState, 600);
+
+  const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+  url.searchParams.set("client_id", GOOGLE_CLIENT_ID);
+  url.searchParams.set("redirect_uri", OAUTH_REDIRECT_URI);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("scope", "openid email profile");
+  url.searchParams.set("state", oauthState);
+  res.redirect(url.toString());
+});
+
 app.get("/auth/google/callback", async (req: Request, res: Response) => {
   if (!requireOAuthConfig(res)) return;
 
@@ -266,42 +455,32 @@ app.get("/auth/google/callback", async (req: Request, res: Response) => {
     return;
   }
 
-  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_id: GOOGLE_CLIENT_ID,
-      client_secret: GOOGLE_CLIENT_SECRET,
-      code,
-      grant_type: "authorization_code",
-      redirect_uri: OAUTH_REDIRECT_URI,
-    }),
-  });
-
-  if (!tokenResponse.ok) {
-    res.status(401).send("Google token exchange failed");
-    return;
-  }
-
-  const tokenJson = (await tokenResponse.json()) as { access_token?: string };
-  if (!tokenJson.access_token) {
-    res.status(401).send("Google access token missing");
-    return;
-  }
-
-  const userResponse = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
-    headers: { Authorization: `Bearer ${tokenJson.access_token}` },
-  });
-
-  if (!userResponse.ok) {
+  const user = await exchangeGoogleCode(code, OAUTH_REDIRECT_URI);
+  if (!user) {
     res.status(401).send("Google user lookup failed");
     return;
   }
 
-  const user = (await userResponse.json()) as GoogleUser;
   const email = user.email || "";
   if (!user.verified_email || !isAllowedEmail(email)) {
     res.status(403).send(`Only @${ALLOWED_DOMAIN} accounts are allowed`);
+    return;
+  }
+
+  const pending = pendingOAuthStates.get(state);
+  if (pending) {
+    pendingOAuthStates.delete(state);
+    const oauthCode = randomBytes(24).toString("hex");
+    authorizationCodes.set(oauthCode, {
+      ...pending,
+      email,
+      exp: Date.now() + 10 * 60 * 1000,
+    });
+
+    const redirectUrl = new URL(pending.redirect_uri);
+    redirectUrl.searchParams.set("code", oauthCode);
+    if (pending.state) redirectUrl.searchParams.set("state", pending.state);
+    res.redirect(redirectUrl.toString());
     return;
   }
 
@@ -312,6 +491,60 @@ app.get("/auth/google/callback", async (req: Request, res: Response) => {
     7 * 24 * 60 * 60
   );
   res.redirect("/");
+});
+
+app.post("/token", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  const body = req.body as {
+    grant_type?: string;
+    code?: string;
+    client_id?: string;
+    client_secret?: string;
+    code_verifier?: string;
+    redirect_uri?: string;
+  };
+
+  if (body.grant_type !== "authorization_code" || !body.code || !body.client_id) {
+    res.status(400).json({ error: "invalid_request" });
+    return;
+  }
+
+  const client = oauthClients.get(body.client_id);
+  const authCode = authorizationCodes.get(body.code);
+  if (!client || !authCode || authCode.exp < Date.now() || authCode.client_id !== body.client_id) {
+    res.status(400).json({ error: "invalid_grant" });
+    return;
+  }
+
+  if (authCode.redirect_uri !== body.redirect_uri) {
+    res.status(400).json({ error: "invalid_grant" });
+    return;
+  }
+
+  if (client.client_secret && client.client_secret !== body.client_secret) {
+    res.status(401).json({ error: "invalid_client" });
+    return;
+  }
+
+  if (authCode.code_challenge) {
+    if (!body.code_verifier || !verifyPkce(body.code_verifier, authCode.code_challenge, authCode.code_challenge_method)) {
+      res.status(400).json({ error: "invalid_grant" });
+      return;
+    }
+  }
+
+  authorizationCodes.delete(body.code);
+  const accessToken = randomBytes(32).toString("hex");
+  accessTokens.set(accessToken, {
+    email: authCode.email,
+    exp: Date.now() + 60 * 60 * 1000,
+  });
+
+  res.json({
+    access_token: accessToken,
+    token_type: "Bearer",
+    expires_in: 3600,
+    scope: "openid email profile",
+  });
 });
 
 app.get("/auth/logout", (_req: Request, res: Response) => {
@@ -331,7 +564,7 @@ app.get("/", (req: Request, res: Response) => {
 
 // MCP endpoint
 app.post("/mcp", async (req: Request, res: Response) => {
-  if (AUTH_MODE === "oauth" && !readSession(req)) {
+  if (AUTH_MODE === "oauth" && !readSession(req) && !readBearerToken(req)) {
     unauthorized(res);
     return;
   }
