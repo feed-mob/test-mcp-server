@@ -13,9 +13,16 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
 const ALLOWED_DOMAIN = process.env.ALLOWED_DOMAIN || "feedmob.com";
 const SESSION_SECRET = process.env.SESSION_SECRET || GOOGLE_CLIENT_SECRET || "dev-session-secret";
+const TOKEN_SECRET = process.env.TOKEN_SECRET || SESSION_SECRET;
 const OAUTH_REDIRECT_URI = `${BASE_URL}/auth/google/callback`;
 const SESSION_COOKIE = "docs_mcp_session";
 const STATE_COOKIE = "docs_mcp_oauth_state";
+const DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
+const DEVICE_CODE_TTL_SECONDS = 10 * 60;
+const DEVICE_CODE_INTERVAL_SECONDS = 5;
+const ACCESS_TOKEN_TTL_SECONDS = parseInt(process.env.ACCESS_TOKEN_TTL_SECONDS || "86400", 10);
+const REFRESH_TOKEN_TTL_SECONDS = parseInt(process.env.REFRESH_TOKEN_TTL_SECONDS || "7776000", 10);
+const DEFAULT_SCOPE = "openid email profile";
 let db = null;
 function getDb() {
     if (!db) {
@@ -25,8 +32,10 @@ function getDb() {
 }
 const oauthClients = new Map();
 const pendingOAuthStates = new Map();
+const pendingDeviceOAuthStates = new Map();
 const authorizationCodes = new Map();
-const accessTokens = new Map();
+const deviceAuthorizations = new Map();
+const deviceCodesByUserCode = new Map();
 function parseCookies(header) {
     if (!header)
         return {};
@@ -46,6 +55,9 @@ function base64Url(input) {
 function sign(value) {
     return base64Url(createHmac("sha256", SESSION_SECRET).update(value).digest());
 }
+function signWithSecret(value, secret) {
+    return base64Url(createHmac("sha256", secret).update(value).digest());
+}
 function safeEqual(a, b) {
     const left = Buffer.from(a);
     const right = Buffer.from(b);
@@ -54,6 +66,63 @@ function safeEqual(a, b) {
 function createSignedToken(payload) {
     const encoded = base64Url(JSON.stringify(payload));
     return `${encoded}.${sign(encoded)}`;
+}
+function createOAuthToken(payload, ttlSeconds) {
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const encoded = base64Url(JSON.stringify({
+        ...payload,
+        iat: nowSeconds,
+        exp: nowSeconds + ttlSeconds,
+    }));
+    return `${encoded}.${signWithSecret(encoded, TOKEN_SECRET)}`;
+}
+function readOAuthToken(token, expectedType) {
+    const [encoded, signature] = token.split(".");
+    if (!encoded || !signature || !safeEqual(signature, signWithSecret(encoded, TOKEN_SECRET)))
+        return null;
+    try {
+        const payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+        if (payload.typ !== expectedType || !payload.email || !payload.client_id || !payload.scope)
+            return null;
+        if (payload.exp * 1000 < Date.now())
+            return null;
+        return payload;
+    }
+    catch {
+        return null;
+    }
+}
+function createSignedClientId(payload) {
+    const encoded = base64Url(JSON.stringify(payload));
+    return `${encoded}.${signWithSecret(encoded, TOKEN_SECRET)}`;
+}
+function readSignedClient(clientId) {
+    const [encoded, signature] = clientId.split(".");
+    if (!encoded || !signature || !safeEqual(signature, signWithSecret(encoded, TOKEN_SECRET)))
+        return null;
+    try {
+        const payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+        if (payload.typ !== "client" || !payload.jti || !Array.isArray(payload.redirect_uris))
+            return null;
+        if (payload.client_secret_expires_at && payload.client_secret_expires_at < Math.floor(Date.now() / 1000)) {
+            return null;
+        }
+        return {
+            client_id: clientId,
+            client_secret_hash: payload.client_secret_hash,
+            redirect_uris: payload.redirect_uris,
+            token_endpoint_auth_method: payload.token_endpoint_auth_method,
+            client_name: payload.client_name,
+            scope: payload.scope,
+            grant_types: payload.grant_types,
+            response_types: payload.response_types,
+            client_id_issued_at: payload.client_id_issued_at,
+            client_secret_expires_at: payload.client_secret_expires_at,
+        };
+    }
+    catch {
+        return null;
+    }
 }
 function readSession(req) {
     const token = parseCookies(req.headers.cookie)[SESSION_COOKIE];
@@ -96,9 +165,10 @@ function oauthMetadata() {
         issuer: BASE_URL,
         authorization_endpoint: `${BASE_URL}/authorize`,
         token_endpoint: `${BASE_URL}/token`,
+        device_authorization_endpoint: `${BASE_URL}/device_authorization`,
         registration_endpoint: `${BASE_URL}/register`,
         response_types_supported: ["code"],
-        grant_types_supported: ["authorization_code"],
+        grant_types_supported: ["authorization_code", DEVICE_CODE_GRANT, "refresh_token"],
         code_challenge_methods_supported: ["S256"],
         token_endpoint_auth_methods_supported: ["client_secret_post", "none"],
         scopes_supported: ["openid", "email", "profile"],
@@ -113,21 +183,67 @@ function protectedResourceMetadata() {
         resource_name: "Docs MCP Server",
     };
 }
+function clientSecretHash(client) {
+    if (client.client_secret_hash)
+        return client.client_secret_hash;
+    if (!client.client_secret)
+        return undefined;
+    return base64Url(createHash("sha256").update(client.client_secret).digest());
+}
+function hashClientSecret(secret) {
+    return base64Url(createHash("sha256").update(secret).digest());
+}
+function getOAuthClient(clientId) {
+    return oauthClients.get(clientId) || readSignedClient(clientId);
+}
+function authenticateClient(body) {
+    if (!body.client_id)
+        return null;
+    const client = getOAuthClient(body.client_id);
+    if (!client)
+        return null;
+    if (client.client_secret && client.client_secret !== body.client_secret)
+        return null;
+    if (client.client_secret_hash && (!body.client_secret || hashClientSecret(body.client_secret) !== client.client_secret_hash)) {
+        return null;
+    }
+    return client;
+}
+function issueTokenResponse(client, email, scope = DEFAULT_SCOPE) {
+    return issueTokenResponseFromPayload({
+        email,
+        client_id: client.client_id,
+        scope,
+        client_secret_hash: clientSecretHash(client),
+    });
+}
+function issueTokenResponseFromPayload(tokenPayload) {
+    return {
+        access_token: createOAuthToken({ typ: "access", ...tokenPayload }, ACCESS_TOKEN_TTL_SECONDS),
+        refresh_token: createOAuthToken({ typ: "refresh", ...tokenPayload }, REFRESH_TOKEN_TTL_SECONDS),
+        token_type: "Bearer",
+        expires_in: ACCESS_TOKEN_TTL_SECONDS,
+        scope: tokenPayload.scope,
+    };
+}
 function readBearerToken(req) {
     const authorization = req.headers.authorization || "";
     const match = authorization.match(/^Bearer\s+(.+)$/i);
     if (!match)
         return null;
-    const token = accessTokens.get(match[1]);
-    if (!token || token.exp < Date.now())
+    const token = readOAuthToken(match[1], "access");
+    if (!token)
         return null;
-    return token;
+    const client = getOAuthClient(token.client_id);
+    if (client?.client_secret && token.client_secret_hash !== clientSecretHash(client))
+        return null;
+    return { email: token.email, exp: token.exp * 1000 };
 }
 function unauthorized(res) {
     res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${BASE_URL}/.well-known/oauth-protected-resource/mcp"`);
     res.status(401).json({
         error: "unauthorized",
-        authUrl: `${BASE_URL}/auth/google/login`,
+        authUrl: `${BASE_URL}/login`,
     });
 }
 function redirectWithOAuthError(res, redirectUri, error, state) {
@@ -136,6 +252,84 @@ function redirectWithOAuthError(res, redirectUri, error, state) {
     if (state)
         url.searchParams.set("state", state);
     res.redirect(url.toString());
+}
+function htmlPage(title, body) {
+    return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${title}</title>
+  <style>
+    :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f5f7fb; color: #172033; }
+    main { width: min(560px, calc(100vw - 32px)); padding: 32px; background: white; border: 1px solid #d8dee9; border-radius: 8px; box-shadow: 0 10px 30px rgb(15 23 42 / 12%); }
+    h1 { margin: 0 0 16px; font-size: 24px; line-height: 1.2; }
+    p { line-height: 1.55; }
+    a, button { display: inline-flex; align-items: center; min-height: 40px; padding: 0 14px; border: 1px solid #1f6feb; border-radius: 6px; background: #1f6feb; color: white; text-decoration: none; font: inherit; cursor: pointer; }
+    input { width: 100%; box-sizing: border-box; min-height: 44px; padding: 8px 12px; border: 1px solid #b8c0cc; border-radius: 6px; font: inherit; text-transform: uppercase; letter-spacing: 0.04em; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
+    .secondary { background: white; color: #1f6feb; }
+    .code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 30px; letter-spacing: 0.12em; }
+    @media (prefers-color-scheme: dark) {
+      body { background: #0d1117; color: #e6edf3; }
+      main { background: #161b22; border-color: #30363d; box-shadow: none; }
+      input, .secondary { background: #0d1117; color: #e6edf3; border-color: #30363d; }
+    }
+  </style>
+</head>
+<body><main>${body}</main></body>
+</html>`;
+}
+function normalizeUserCode(value) {
+    return value.toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+function formatUserCode(value) {
+    return `${value.slice(0, 4)}-${value.slice(4)}`;
+}
+function generateUserCode() {
+    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+        let code = "";
+        for (let i = 0; i < 8; i += 1) {
+            code += alphabet[randomBytes(1)[0] % alphabet.length];
+        }
+        if (!deviceCodesByUserCode.has(code))
+            return code;
+    }
+    return randomBytes(6).toString("hex").toUpperCase();
+}
+function getDeviceAuthorizationByUserCode(userCode) {
+    const normalized = normalizeUserCode(userCode);
+    const deviceCode = deviceCodesByUserCode.get(normalized);
+    if (!deviceCode)
+        return null;
+    const authorization = deviceAuthorizations.get(deviceCode);
+    if (!authorization) {
+        deviceCodesByUserCode.delete(normalized);
+        return null;
+    }
+    if (authorization.exp < Date.now()) {
+        deviceAuthorizations.delete(deviceCode);
+        deviceCodesByUserCode.delete(normalized);
+        return null;
+    }
+    return authorization;
+}
+function consumeDeviceOAuthState(state) {
+    const deviceCode = pendingDeviceOAuthStates.get(state);
+    if (!deviceCode)
+        return null;
+    const authorization = deviceAuthorizations.get(deviceCode);
+    if (!authorization || authorization.exp < Date.now()) {
+        pendingDeviceOAuthStates.delete(state);
+        if (authorization) {
+            deviceAuthorizations.delete(deviceCode);
+            deviceCodesByUserCode.delete(authorization.user_code);
+        }
+        return null;
+    }
+    return authorization;
 }
 async function exchangeGoogleCode(code, redirectUri) {
     const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
@@ -249,24 +443,63 @@ app.get("/.well-known/oauth-protected-resource/mcp", (_req, res) => {
 });
 app.post("/register", (req, res) => {
     const body = req.body;
-    if (!Array.isArray(body.redirect_uris) || body.redirect_uris.length === 0) {
+    const grantTypes = Array.isArray(body.grant_types) && body.grant_types.length > 0
+        ? body.grant_types
+        : ["authorization_code", DEVICE_CODE_GRANT, "refresh_token"];
+    const responseTypes = Array.isArray(body.response_types) && body.response_types.length > 0
+        ? body.response_types
+        : grantTypes.includes("authorization_code")
+            ? ["code"]
+            : [];
+    const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris : [];
+    if (grantTypes.includes("authorization_code") && redirectUris.length === 0) {
         res.status(400).json({ error: "invalid_client_metadata", error_description: "redirect_uris is required" });
         return;
     }
-    const clientId = randomBytes(16).toString("hex");
     const isPublic = body.token_endpoint_auth_method === "none";
-    const client = {
-        client_id: clientId,
-        client_secret: isPublic ? undefined : randomBytes(32).toString("hex"),
-        redirect_uris: body.redirect_uris,
+    const clientSecret = isPublic ? undefined : randomBytes(32).toString("hex");
+    const issuedAt = Math.floor(Date.now() / 1000);
+    const secretExpiresAt = isPublic ? undefined : issuedAt + 30 * 24 * 60 * 60;
+    const clientId = createSignedClientId({
+        typ: "client",
+        jti: randomBytes(16).toString("hex"),
+        client_secret_hash: clientSecret ? hashClientSecret(clientSecret) : undefined,
+        redirect_uris: redirectUris,
         token_endpoint_auth_method: body.token_endpoint_auth_method || (isPublic ? "none" : "client_secret_post"),
         client_name: body.client_name,
         scope: body.scope,
-        client_id_issued_at: Math.floor(Date.now() / 1000),
-        client_secret_expires_at: isPublic ? undefined : Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60,
+        grant_types: grantTypes,
+        response_types: responseTypes,
+        client_id_issued_at: issuedAt,
+        client_secret_expires_at: secretExpiresAt,
+    });
+    const client = {
+        client_id: clientId,
+        client_secret: clientSecret,
+        client_secret_hash: clientSecret ? hashClientSecret(clientSecret) : undefined,
+        redirect_uris: redirectUris,
+        token_endpoint_auth_method: body.token_endpoint_auth_method || (isPublic ? "none" : "client_secret_post"),
+        client_name: body.client_name,
+        scope: body.scope,
+        grant_types: grantTypes,
+        response_types: responseTypes,
+        client_id_issued_at: issuedAt,
+        client_secret_expires_at: secretExpiresAt,
     };
     oauthClients.set(clientId, client);
-    res.status(201).json(client);
+    const { client_secret_hash: _clientSecretHash, ...clientResponse } = client;
+    res.status(201).json(clientResponse);
+});
+app.get("/login", (_req, res) => {
+    res
+        .status(200)
+        .type("html")
+        .send(htmlPage("Docs MCP Login", `<h1>Docs MCP Login</h1>
+        <p>Use browser login for local MCP clients that can receive an OAuth callback. Use device login when a CLI, SSH session, CI job, or remote server shows you a device code.</p>
+        <div class="row">
+          <a href="/auth/google/login">Browser Login</a>
+          <a class="secondary" href="/device">Device Login</a>
+        </div>`));
 });
 app.get("/auth/google/login", (_req, res) => {
     if (!requireOAuthConfig(res))
@@ -282,6 +515,73 @@ app.get("/auth/google/login", (_req, res) => {
     url.searchParams.set("access_type", "offline");
     res.redirect(url.toString());
 });
+app.post("/device_authorization", express.urlencoded({ extended: false }), (req, res) => {
+    const body = req.body;
+    const client = authenticateClient(body);
+    if (!client) {
+        res.status(401).json({ error: "invalid_client" });
+        return;
+    }
+    const deviceCode = randomBytes(32).toString("hex");
+    const userCode = generateUserCode();
+    const authorization = {
+        client_id: client.client_id,
+        device_code: deviceCode,
+        user_code: userCode,
+        scope: body.scope || client.scope || DEFAULT_SCOPE,
+        resource: body.resource,
+        status: "pending",
+        exp: Date.now() + DEVICE_CODE_TTL_SECONDS * 1000,
+        intervalSeconds: DEVICE_CODE_INTERVAL_SECONDS,
+    };
+    deviceAuthorizations.set(deviceCode, authorization);
+    deviceCodesByUserCode.set(userCode, deviceCode);
+    res.json({
+        device_code: deviceCode,
+        user_code: formatUserCode(userCode),
+        verification_uri: `${BASE_URL}/device`,
+        verification_uri_complete: `${BASE_URL}/device?user_code=${encodeURIComponent(formatUserCode(userCode))}`,
+        expires_in: DEVICE_CODE_TTL_SECONDS,
+        interval: DEVICE_CODE_INTERVAL_SECONDS,
+    });
+});
+app.get("/device", (req, res) => {
+    const userCode = req.query.user_code ? formatUserCode(normalizeUserCode(String(req.query.user_code))) : "";
+    res
+        .status(200)
+        .type("html")
+        .send(htmlPage("Device Login", `<h1>Device Login</h1>
+        <p>Enter the device code shown by your MCP client or CLI.</p>
+        <form method="post" action="/device">
+          <input name="user_code" value="${userCode}" autocomplete="one-time-code" autofocus required>
+          <div class="row"><button type="submit">Continue with Google</button></div>
+        </form>`));
+});
+app.post("/device", express.urlencoded({ extended: false }), (req, res) => {
+    if (!requireOAuthConfig(res))
+        return;
+    const body = req.body;
+    const authorization = getDeviceAuthorizationByUserCode(String(body.user_code || ""));
+    if (!authorization) {
+        res
+            .status(400)
+            .type("html")
+            .send(htmlPage("Invalid Device Code", `<h1>Invalid Device Code</h1>
+          <p>The code was not found or has expired.</p>
+          <div class="row"><a href="/device">Try Again</a></div>`));
+        return;
+    }
+    const state = randomBytes(24).toString("hex");
+    pendingDeviceOAuthStates.set(state, authorization.device_code);
+    setCookie(res, STATE_COOKIE, state, DEVICE_CODE_TTL_SECONDS);
+    const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+    url.searchParams.set("client_id", GOOGLE_CLIENT_ID);
+    url.searchParams.set("redirect_uri", OAUTH_REDIRECT_URI);
+    url.searchParams.set("response_type", "code");
+    url.searchParams.set("scope", DEFAULT_SCOPE);
+    url.searchParams.set("state", state);
+    res.redirect(url.toString());
+});
 app.get("/authorize", (req, res) => {
     if (!requireOAuthConfig(res))
         return;
@@ -294,7 +594,7 @@ app.get("/authorize", (req, res) => {
         ? String(req.query.code_challenge_method)
         : undefined;
     const resource = req.query.resource ? String(req.query.resource) : undefined;
-    const client = oauthClients.get(clientId);
+    const client = getOAuthClient(clientId);
     if (!client || !client.redirect_uris.includes(redirectUri) || responseType !== "code") {
         if (redirectUri)
             redirectWithOAuthError(res, redirectUri, "invalid_request", state);
@@ -302,11 +602,16 @@ app.get("/authorize", (req, res) => {
             res.status(400).json({ error: "invalid_request" });
         return;
     }
+    if (!codeChallenge || codeChallengeMethod !== "S256") {
+        redirectWithOAuthError(res, redirectUri, "invalid_request", state);
+        return;
+    }
     const oauthState = randomBytes(24).toString("hex");
     pendingOAuthStates.set(oauthState, {
         client_id: clientId,
         redirect_uri: redirectUri,
         state,
+        scope: req.query.scope ? String(req.query.scope) : client.scope || DEFAULT_SCOPE,
         code_challenge: codeChallenge,
         code_challenge_method: codeChallengeMethod,
         resource,
@@ -341,6 +646,18 @@ app.get("/auth/google/callback", async (req, res) => {
         res.status(403).send(`Only @${ALLOWED_DOMAIN} accounts are allowed`);
         return;
     }
+    const pendingDevice = consumeDeviceOAuthState(state);
+    if (pendingDevice) {
+        pendingDeviceOAuthStates.delete(state);
+        pendingDevice.email = email;
+        pendingDevice.status = "approved";
+        res
+            .status(200)
+            .type("html")
+            .send(htmlPage("Device Login Approved", `<h1>Device Login Approved</h1>
+          <p>You can return to your MCP client or CLI now.</p>`));
+        return;
+    }
     const pending = pendingOAuthStates.get(state);
     if (pending) {
         pendingOAuthStates.delete(state);
@@ -362,42 +679,107 @@ app.get("/auth/google/callback", async (req, res) => {
 });
 app.post("/token", express.urlencoded({ extended: false }), (req, res) => {
     const body = req.body;
-    if (body.grant_type !== "authorization_code" || !body.code || !body.client_id) {
-        res.status(400).json({ error: "invalid_request" });
-        return;
-    }
-    const client = oauthClients.get(body.client_id);
-    const authCode = authorizationCodes.get(body.code);
-    if (!client || !authCode || authCode.exp < Date.now() || authCode.client_id !== body.client_id) {
-        res.status(400).json({ error: "invalid_grant" });
-        return;
-    }
-    if (authCode.redirect_uri !== body.redirect_uri) {
-        res.status(400).json({ error: "invalid_grant" });
-        return;
-    }
-    if (client.client_secret && client.client_secret !== body.client_secret) {
-        res.status(401).json({ error: "invalid_client" });
-        return;
-    }
-    if (authCode.code_challenge) {
-        if (!body.code_verifier || !verifyPkce(body.code_verifier, authCode.code_challenge, authCode.code_challenge_method)) {
+    if (body.grant_type === "refresh_token") {
+        if (!body.refresh_token) {
+            res.status(400).json({ error: "invalid_request" });
+            return;
+        }
+        const refreshToken = readOAuthToken(body.refresh_token, "refresh");
+        if (!refreshToken) {
             res.status(400).json({ error: "invalid_grant" });
             return;
         }
+        if (body.client_id && body.client_id !== refreshToken.client_id) {
+            res.status(400).json({ error: "invalid_grant" });
+            return;
+        }
+        const client = getOAuthClient(refreshToken.client_id);
+        if (client?.client_secret && client.client_secret !== body.client_secret) {
+            res.status(401).json({ error: "invalid_client" });
+            return;
+        }
+        if (client?.client_secret && refreshToken.client_secret_hash !== clientSecretHash(client)) {
+            res.status(400).json({ error: "invalid_grant" });
+            return;
+        }
+        res.json(issueTokenResponseFromPayload({
+            email: refreshToken.email,
+            client_id: refreshToken.client_id,
+            scope: refreshToken.scope,
+            client_secret_hash: refreshToken.client_secret_hash,
+        }));
+        return;
     }
-    authorizationCodes.delete(body.code);
-    const accessToken = randomBytes(32).toString("hex");
-    accessTokens.set(accessToken, {
-        email: authCode.email,
-        exp: Date.now() + 60 * 60 * 1000,
-    });
-    res.json({
-        access_token: accessToken,
-        token_type: "Bearer",
-        expires_in: 3600,
-        scope: "openid email profile",
-    });
+    const client = authenticateClient(body);
+    if (!client) {
+        res.status(401).json({ error: "invalid_client" });
+        return;
+    }
+    if (body.grant_type === "authorization_code") {
+        if (!body.code) {
+            res.status(400).json({ error: "invalid_request" });
+            return;
+        }
+        const authCode = authorizationCodes.get(body.code);
+        if (!authCode || authCode.exp < Date.now() || authCode.client_id !== client.client_id) {
+            res.status(400).json({ error: "invalid_grant" });
+            return;
+        }
+        if (authCode.redirect_uri !== body.redirect_uri) {
+            res.status(400).json({ error: "invalid_grant" });
+            return;
+        }
+        if (authCode.code_challenge) {
+            if (!body.code_verifier || !verifyPkce(body.code_verifier, authCode.code_challenge, authCode.code_challenge_method)) {
+                res.status(400).json({ error: "invalid_grant" });
+                return;
+            }
+        }
+        authorizationCodes.delete(body.code);
+        res.json(issueTokenResponse(client, authCode.email, authCode.scope || client.scope || DEFAULT_SCOPE));
+        return;
+    }
+    if (body.grant_type === DEVICE_CODE_GRANT) {
+        if (!body.device_code) {
+            res.status(400).json({ error: "invalid_request" });
+            return;
+        }
+        const authorization = deviceAuthorizations.get(body.device_code);
+        if (!authorization || authorization.exp < Date.now() || authorization.client_id !== client.client_id) {
+            if (authorization) {
+                deviceAuthorizations.delete(body.device_code);
+                deviceCodesByUserCode.delete(authorization.user_code);
+            }
+            res.status(400).json({ error: "expired_token" });
+            return;
+        }
+        const now = Date.now();
+        if (authorization.lastPollAt && now - authorization.lastPollAt < authorization.intervalSeconds * 1000) {
+            authorization.intervalSeconds += DEVICE_CODE_INTERVAL_SECONDS;
+            res.status(400).json({ error: "slow_down", interval: authorization.intervalSeconds });
+            return;
+        }
+        authorization.lastPollAt = now;
+        if (authorization.status === "denied") {
+            deviceAuthorizations.delete(authorization.device_code);
+            deviceCodesByUserCode.delete(authorization.user_code);
+            res.status(400).json({ error: "access_denied" });
+            return;
+        }
+        if (authorization.status !== "approved" || !authorization.email) {
+            res.status(400).json({ error: "authorization_pending" });
+            return;
+        }
+        deviceAuthorizations.delete(authorization.device_code);
+        deviceCodesByUserCode.delete(authorization.user_code);
+        res.json(issueTokenResponse(client, authorization.email, authorization.scope || client.scope || DEFAULT_SCOPE));
+        return;
+    }
+    if (!body.grant_type) {
+        res.status(400).json({ error: "invalid_request" });
+        return;
+    }
+    res.status(400).json({ error: "unsupported_grant_type" });
 });
 app.get("/auth/logout", (_req, res) => {
     clearCookie(res, SESSION_COOKIE);
