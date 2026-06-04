@@ -18,110 +18,114 @@ function getDb(): DatabaseSync {
   return db;
 }
 
-const mcpServer = new McpServer({
-  name: "docs-mcp-server",
-  version: "1.0.0",
-});
+function createMcpServer(): McpServer {
+  const mcpServer = new McpServer({
+    name: "docs-mcp-server",
+    version: "1.0.0",
+  });
 
-mcpServer.tool(
-  "search_docs",
-  "Search the documentation using full-text search. Returns matching page titles and snippets.",
-  {
-    query: z.string().describe("The search query string"),
-    limit: z
-      .number()
-      .optional()
-      .default(10)
-      .describe("Maximum number of results to return (default 10)"),
-  },
-  async ({ query, limit }) => {
-    const database = getDb();
-    const stmt = database.prepare(
-      "SELECT p.id, p.title, p.url, p.file_path, snippet(pages_fts, 1, '>>> ', ' <<<', '...', 64) AS snippet FROM pages_fts f JOIN pages p ON p.id = f.rowid WHERE pages_fts MATCH ? ORDER BY rank LIMIT ?"
-    );
-    const rows = stmt.all(query, limit) as Array<{
-      id: number;
-      title: string;
-      url: string;
-      file_path: string;
-      snippet: string;
-    }>;
+  mcpServer.tool(
+    "search_docs",
+    "Search the documentation using full-text search. Returns matching page titles and snippets.",
+    {
+      query: z.string().describe("The search query string"),
+      limit: z
+        .number()
+        .optional()
+        .default(10)
+        .describe("Maximum number of results to return (default 10)"),
+    },
+    async ({ query, limit }) => {
+      const database = getDb();
+      const stmt = database.prepare(
+        "SELECT p.id, p.title, p.url, p.file_path, snippet(pages_fts, 1, '>>> ', ' <<<', '...', 64) AS snippet FROM pages_fts f JOIN pages p ON p.id = f.rowid WHERE pages_fts MATCH ? ORDER BY rank LIMIT ?"
+      );
+      const rows = stmt.all(query, limit) as Array<{
+        id: number;
+        title: string;
+        url: string;
+        file_path: string;
+        snippet: string;
+      }>;
 
-    if (rows.length === 0) {
+      if (rows.length === 0) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `No results found for "${query}".`,
+            },
+          ],
+        };
+      }
+
+      const result = rows
+        .map(
+          (r, i) =>
+            `${i + 1}. **${r.title}**\n   URL: ${r.url}\n   File: ${r.file_path}\n   ${r.snippet}`
+        )
+        .join("\n\n");
+
       return {
         content: [
           {
             type: "text" as const,
-            text: `No results found for "${query}".`,
+            text: `Found ${rows.length} result(s) for "${query}":\n\n${result}`,
           },
         ],
       };
     }
+  );
 
-    const result = rows
-      .map(
-        (r, i) =>
-          `${i + 1}. **${r.title}**\n   URL: ${r.url}\n   File: ${r.file_path}\n   ${r.snippet}`
-      )
-      .join("\n\n");
+  mcpServer.tool(
+    "get_page",
+    "Get the full content of a documentation page by its file path or page ID.",
+    {
+      identifier: z
+        .string()
+        .describe(
+          "The file path (e.g. 'Trafficking/Core-Objects/006-Campaigns.md') or page ID of the page to retrieve"
+        ),
+    },
+    async ({ identifier }) => {
+      const database = getDb();
+      const stmt = database.prepare(
+        "SELECT id, page_id, title, url, depth, file_path, content FROM pages WHERE file_path = ? OR page_id = ? LIMIT 1"
+      );
+      const row = stmt.get(identifier, identifier) as {
+        id: number;
+        page_id: string;
+        title: string;
+        url: string;
+        depth: number;
+        file_path: string;
+        content: string;
+      } | null;
 
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: `Found ${rows.length} result(s) for "${query}":\n\n${result}`,
-        },
-      ],
-    };
-  }
-);
+      if (!row) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Page not found: "${identifier}". Try using search_docs to find the right page.`,
+            },
+          ],
+        };
+      }
 
-mcpServer.tool(
-  "get_page",
-  "Get the full content of a documentation page by its file path or page ID.",
-  {
-    identifier: z
-      .string()
-      .describe(
-        "The file path (e.g. 'Trafficking/Core-Objects/006-Campaigns.md') or page ID of the page to retrieve"
-      ),
-  },
-  async ({ identifier }) => {
-    const database = getDb();
-    const stmt = database.prepare(
-      "SELECT id, page_id, title, url, depth, file_path, content FROM pages WHERE file_path = ? OR page_id = ? LIMIT 1"
-    );
-    const row = stmt.get(identifier, identifier) as {
-      id: number;
-      page_id: string;
-      title: string;
-      url: string;
-      depth: number;
-      file_path: string;
-      content: string;
-    } | null;
-
-    if (!row) {
       return {
         content: [
           {
             type: "text" as const,
-            text: `Page not found: "${identifier}". Try using search_docs to find the right page.`,
+            text: `# ${row.title}\n\n**Page ID:** ${row.page_id}\n**URL:** ${row.url}\n**File:** ${row.file_path}\n**Depth:** ${row.depth}\n\n---\n\n${row.content}`,
           },
         ],
       };
     }
+  );
 
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: `# ${row.title}\n\n**Page ID:** ${row.page_id}\n**URL:** ${row.url}\n**File:** ${row.file_path}\n**Depth:** ${row.depth}\n\n---\n\n${row.content}`,
-        },
-      ],
-    };
-  }
-);
+  return mcpServer;
+}
 
 // --- HTTP Server ---
 
@@ -133,18 +137,20 @@ app.get("/health", (_req: Request, res: Response) => {
   res.status(200).json({ ok: true });
 });
 
-const transport = new StreamableHTTPServerTransport({
-  sessionIdGenerator: undefined, // stateless
-});
-
-const setupServer = async () => {
-  await mcpServer.connect(transport);
-};
-
 // MCP endpoint
 app.post("/mcp", async (req: Request, res: Response) => {
+  const mcpServer = createMcpServer();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+  });
+
   try {
+    await mcpServer.connect(transport);
     await transport.handleRequest(req, res, req.body);
+    res.on("close", () => {
+      transport.close();
+      mcpServer.close();
+    });
   } catch (error) {
     console.error("Error handling MCP request:", error);
     if (!res.headersSent) {
@@ -177,10 +183,8 @@ app.delete("/mcp", async (_req: Request, res: Response) => {
   );
 });
 
-setupServer().then(() => {
-  app.listen(PORT, HOST, () => {
-    console.log(`Docs MCP Server listening on ${HOST}:${PORT}`);
-    console.log(`Health check: http://${HOST}:${PORT}/health`);
-    console.log(`MCP endpoint: http://${HOST}:${PORT}/mcp`);
-  });
+app.listen(PORT, HOST, () => {
+  console.log(`Docs MCP Server listening on ${HOST}:${PORT}`);
+  console.log(`Health check: http://${HOST}:${PORT}/health`);
+  console.log(`MCP endpoint: http://${HOST}:${PORT}/mcp`);
 });
