@@ -1,0 +1,52 @@
+name: Deploy Publisher Acceptance Site
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: publisher-acceptance-pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Build and deploy acceptance site
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build static acceptance site
+        env:
+          SITE_DIR: ${{ runner.temp }}/publisher-site
+        run: |
+          set -eu
+          mkdir -p "$SITE_DIR"
+          cp publisher-test/index.html "$SITE_DIR/index.html"
+          cat > "$SITE_DIR/release.json" <<EOF
+          {
+            "project": "feed-mob/test-mcp-server",
+            "purpose": "FeedMob Project Publisher acceptance test",
+            "commit": "${GITHUB_SHA}",
+            "run": "${GITHUB_RUN_ID}"
+          }
+          EOF
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}/publisher-site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
